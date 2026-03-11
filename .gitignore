@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 build/
 detection/build/
+TRADER-crypto-arbitrage-dynamic-graph/
+detectors.json
+route_output.json

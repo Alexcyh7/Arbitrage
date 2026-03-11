@@ -817,6 +817,10 @@ std::vector<std::pair<double, std::vector<uint32_t>>> KCycleColorCoding::find_mo
             top_cycles.pop();
             top_cycles.emplace(trial_best_weight, trial_best_cycle);
         }
+
+        // Store last trial state for dynamic updates
+        current_best_weight_ = trial_best_weight;
+        current_best_cycle_ = trial_best_cycle;
     }
 
     std::vector<CycleInfo> result;

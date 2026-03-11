@@ -16,6 +16,14 @@ public:
         const std::vector<unsigned int>& trial_seeds,
         const std::string& dynamic_graph_file);
 
+    // Dynamic update interface (call after find_most_negative_k_cycle)
+    double current_best_weight_ = std::numeric_limits<double>::infinity();
+    std::vector<uint32_t> current_best_cycle_;
+
+    void dynamic_update_edge(uint32_t src, uint32_t dst, double weight) {
+        update_edge_weight(src, dst, weight, current_best_weight_, current_best_cycle_);
+    }
+
 private:
     DirectedGraph graph;
     std::unordered_map<uint32_t, int> node_colors;

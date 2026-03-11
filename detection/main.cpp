@@ -11,8 +11,200 @@
 #include <vector>
 #include <limits>
 #include <chrono>
+#include <iomanip>
+
+// Socket includes for TCP server
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <cstring>
 
 const std::string WETH = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2";
+
+// Convert double to integer string (no scientific notation)
+inline std::string amount_to_string(double val) {
+    if (val <= 0) return "0";
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%.0f", val);
+    return std::string(buf);
+}
+
+// ──────────────────────────────────────────────
+//  Per-edge tracking: all pools contributing to each directed edge
+// ──────────────────────────────────────────────
+struct EdgePoolInfo {
+    std::unordered_map<size_t, double> pool_weights; // pool_idx -> weight
+    double best_weight = std::numeric_limits<double>::infinity();
+    size_t best_pool_idx = 0;
+
+    // Recompute best from all pool weights
+    void recompute_best() {
+        best_weight = std::numeric_limits<double>::infinity();
+        for (auto& [pi, w] : pool_weights) {
+            if (w < best_weight) {
+                best_weight = w;
+                best_pool_idx = pi;
+            }
+        }
+    }
+};
+
+// Global edge tracking: all_edges[src_id][dst_id]
+using EdgeMap = std::unordered_map<uint32_t, std::unordered_map<uint32_t, EdgePoolInfo>>;
+
+// ──────────────────────────────────────────────
+//  Compute edge weight for one direction of a pool
+//  Returns weight; sets valid=true if computable
+// ──────────────────────────────────────────────
+inline double compute_edge_weight(
+    const Pool& pool, const std::string& src_token,
+    double qs_src, double qs_dst, bool& valid)
+{
+    double out = get_amount_out(pool, src_token, qs_src);
+    if (out <= 0 || qs_dst <= 0) { valid = false; return 0; }
+    valid = true;
+    return -std::log(out / qs_dst);
+}
+
+// ──────────────────────────────────────────────
+//  Simulate a cycle and return route JSON
+// ──────────────────────────────────────────────
+json simulate_cycle(
+    const std::vector<uint32_t>& cycle,
+    const std::vector<std::string>& id_to_token,
+    const std::unordered_map<std::string, double>& quote_sizes,
+    const EdgeMap& all_edges,
+    const std::vector<Pool>& all_pools,
+    int64_t block_number)
+{
+    json result;
+    result["profitable"] = false;
+
+    if (cycle.size() < 2) return result;
+
+    std::string start_token = id_to_token[cycle[0]];
+    auto qs_it = quote_sizes.find(start_token);
+    if (qs_it == quote_sizes.end()) return result;
+    double current_amount = qs_it->second;
+    double from_amount = current_amount;
+
+    std::cout << "\n=== Simulating Best Cycle ===" << std::endl;
+    std::cout << "Start: " << amount_to_string(from_amount) << " of " << start_token << std::endl;
+
+    json fills = json::array();
+    size_t num_hops = cycle.size() - 1;
+
+    for (size_t i = 0; i < num_hops; i++) {
+        uint32_t src_id = cycle[i];
+        uint32_t dst_id = cycle[i + 1];
+        std::string src_token = id_to_token[src_id];
+        std::string dst_token = id_to_token[dst_id];
+
+        auto& edge_info = all_edges.at(src_id).at(dst_id);
+        size_t pool_idx = edge_info.best_pool_idx;
+        auto& pool = all_pools[pool_idx];
+
+        double amount_out = get_amount_out(pool, src_token, current_amount);
+        std::string source = pool.is_v3 ? "Uniswap_V3" : "Uniswap_V2";
+
+        std::cout << "  Hop " << (i + 1) << ": " << src_token
+                  << " -> " << dst_token
+                  << " via " << pool.address
+                  << " (" << source << ", fee="
+                  << (pool.is_v3 ? pool.fee_v3 : pool.fee_v2) << ")"
+                  << "  in=" << amount_to_string(current_amount)
+                  << "  out=" << amount_to_string(amount_out) << std::endl;
+
+        json fill;
+        fill["from"] = src_token;
+        fill["to"] = dst_token;
+        fill["pool"] = pool.address;
+        fill["source"] = source;
+        fill["proportionBps"] = "10000";
+        fill["expected_output"] = amount_to_string(amount_out);
+        fills.push_back(fill);
+
+        current_amount = amount_out;
+    }
+
+    double to_amount = current_amount;
+    double profit = to_amount - from_amount;
+    double profit_pct = (to_amount / from_amount - 1.0) * 100.0;
+
+    std::cout << "\nEnd:   " << amount_to_string(to_amount) << " of " << start_token << std::endl;
+    std::cout << "Profit: " << (profit >= 0 ? "+" : "") << std::fixed << std::setprecision(4) << profit_pct << "%" << std::endl;
+    if (profit > 0) {
+        std::cout << "*** ARBITRAGE OPPORTUNITY FOUND ***" << std::endl;
+    }
+
+    // Build route JSON
+    result["blockNumber"] = block_number;
+    result["from"] = start_token;
+    result["to"] = start_token;
+    result["fromAmount"] = amount_to_string(from_amount);
+    result["toAmount"] = amount_to_string(to_amount);
+    result["profit"] = amount_to_string(profit);
+    result["profitPct"] = profit_pct;
+    result["profitable"] = (profit > 0);
+    result["route"]["fills"] = fills;
+
+    return result;
+}
+
+// ──────────────────────────────────────────────
+//  Recompute edges for a single pool (both directions)
+//  Returns list of (src_id, dst_id, new_best_weight) for edges that changed
+// ──────────────────────────────────────────────
+std::vector<std::tuple<uint32_t, uint32_t, double>> recompute_pool_edges(
+    size_t pool_idx,
+    const std::vector<Pool>& all_pools,
+    const std::unordered_map<std::string, uint32_t>& token_to_id,
+    const std::unordered_map<std::string, double>& quote_sizes,
+    EdgeMap& all_edges)
+{
+    std::vector<std::tuple<uint32_t, uint32_t, double>> changed;
+    auto& pool = all_pools[pool_idx];
+
+    auto it0 = quote_sizes.find(pool.token0);
+    auto it1 = quote_sizes.find(pool.token1);
+    if (it0 == quote_sizes.end() || it1 == quote_sizes.end()) return changed;
+
+    auto id0_it = token_to_id.find(pool.token0);
+    auto id1_it = token_to_id.find(pool.token1);
+    if (id0_it == token_to_id.end() || id1_it == token_to_id.end()) return changed;
+
+    uint32_t id0 = id0_it->second;
+    uint32_t id1 = id1_it->second;
+    double qs0 = it0->second;
+    double qs1 = it1->second;
+
+    // token0 -> token1
+    bool valid;
+    double w01 = compute_edge_weight(pool, pool.token0, qs0, qs1, valid);
+    if (valid) {
+        auto& ei = all_edges[id0][id1];
+        double old_best = ei.best_weight;
+        ei.pool_weights[pool_idx] = w01;
+        ei.recompute_best();
+        if (ei.best_weight != old_best) {
+            changed.emplace_back(id0, id1, ei.best_weight);
+        }
+    }
+
+    // token1 -> token0
+    double w10 = compute_edge_weight(pool, pool.token1, qs1, qs0, valid);
+    if (valid) {
+        auto& ei = all_edges[id1][id0];
+        double old_best = ei.best_weight;
+        ei.pool_weights[pool_idx] = w10;
+        ei.recompute_best();
+        if (ei.best_weight != old_best) {
+            changed.emplace_back(id1, id0, ei.best_weight);
+        }
+    }
+
+    return changed;
+}
 
 int main(int argc, char* argv[]) {
     if (argc < 4) {
@@ -25,7 +217,7 @@ int main(int argc, char* argv[]) {
     std::string json_file = argv[1];
     unsigned int seed = static_cast<unsigned int>(std::stoul(argv[2]));
     double quote_size_eth = std::stod(argv[3]);
-    // int port = argc > 4 ? std::stoi(argv[4]) : 0;  // reserved for future use
+    int port = argc > 4 ? std::stoi(argv[4]) : 0;
     int k = argc > 5 ? std::stoi(argv[5]) : 3;
 
     double quote_size_wei = quote_size_eth * 1e18;
@@ -43,11 +235,16 @@ int main(int argc, char* argv[]) {
     f.close();
 
     std::vector<Pool> all_pools;
+    int64_t block_number = 0;
+
     for (auto& entry : data) {
         try {
             all_pools.push_back(parse_pool(entry));
+            if (block_number == 0 && entry.contains("block")) {
+                block_number = entry["block"].get<int64_t>();
+            }
         } catch (const std::exception& e) {
-            continue; // skip unparseable pools
+            continue;
         }
     }
 
@@ -55,11 +252,22 @@ int main(int argc, char* argv[]) {
     auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(load_end - load_start).count();
     std::cout << "Parsed " << all_pools.size() << " pools in " << load_ms << " ms" << std::endl;
 
-    // ── 2. Find WETH-connected tokens ─────────────────
+    // ── 2. Build lookup indices ──────────────────────
+    // pool_address -> index in all_pools
+    std::unordered_map<std::string, size_t> pool_address_to_idx;
+    // token -> list of pool indices involving that token
+    std::unordered_map<std::string, std::vector<size_t>> token_to_pool_indices;
+
+    for (size_t i = 0; i < all_pools.size(); i++) {
+        pool_address_to_idx[all_pools[i].address] = i;
+        token_to_pool_indices[all_pools[i].token0].push_back(i);
+        token_to_pool_indices[all_pools[i].token1].push_back(i);
+    }
+
+    // ── 3. Find WETH-connected tokens ─────────────────
     std::unordered_set<std::string> weth_connected;
     weth_connected.insert(WETH);
 
-    // For each token, track which pool indices connect it to WETH
     std::unordered_map<std::string, std::vector<size_t>> weth_pool_indices;
 
     for (size_t i = 0; i < all_pools.size(); i++) {
@@ -75,8 +283,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "WETH-connected tokens: " << weth_connected.size() << std::endl;
 
-    // ── 3. Compute quote sizes ────────────────────────
-    // For each token, swap quote_size_wei of WETH -> token via its best direct pool
+    // ── 4. Compute quote sizes ────────────────────────
     std::unordered_map<std::string, double> quote_sizes;
     quote_sizes[WETH] = quote_size_wei;
 
@@ -95,7 +302,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Tokens with valid quote sizes: " << quote_sizes.size() << std::endl;
 
-    // ── 4. Assign integer IDs to tokens ───────────────
+    // ── 5. Assign integer IDs to tokens ───────────────
     std::unordered_map<std::string, uint32_t> token_to_id;
     std::vector<std::string> id_to_token;
     uint32_t next_id = 0;
@@ -115,16 +322,12 @@ int main(int argc, char* argv[]) {
     }
     std::cout << std::endl;
 
-    // ── 5. Build graph ────────────────────────────────
-    // For each pool where both tokens have quote sizes,
-    // compute edge weights in both directions.
-    // Keep minimum weight per (src, dst) pair across all pools.
+    // ── 6. Build graph with full edge tracking ────────
+    EdgeMap all_edges;
     auto build_start = std::chrono::high_resolution_clock::now();
 
-    std::unordered_map<uint32_t, std::unordered_map<uint32_t, double>> edge_weights;
-
-    for (auto& pool : all_pools) {
-        // Both tokens must have quote sizes
+    for (size_t pi = 0; pi < all_pools.size(); pi++) {
+        auto& pool = all_pools[pi];
         auto it0 = quote_sizes.find(pool.token0);
         auto it1 = quote_sizes.find(pool.token1);
         if (it0 == quote_sizes.end() || it1 == quote_sizes.end()) continue;
@@ -137,30 +340,25 @@ int main(int argc, char* argv[]) {
         // token0 -> token1
         double out01 = get_amount_out(pool, pool.token0, qs0);
         if (out01 > 0) {
-            double weight01 = -std::log(out01 / qs1);
-            auto& w = edge_weights[id0][id1];
-            if (edge_weights[id0].find(id1) == edge_weights[id0].end() || weight01 < w) {
-                w = weight01;
-            }
+            double w01 = -std::log(out01 / qs1);
+            all_edges[id0][id1].pool_weights[pi] = w01;
         }
 
         // token1 -> token0
         double out10 = get_amount_out(pool, pool.token1, qs1);
         if (out10 > 0) {
-            double weight10 = -std::log(out10 / qs0);
-            auto& w = edge_weights[id1][id0];
-            if (edge_weights[id1].find(id0) == edge_weights[id1].end() || weight10 < w) {
-                w = weight10;
-            }
+            double w10 = -std::log(out10 / qs0);
+            all_edges[id1][id0].pool_weights[pi] = w10;
         }
     }
 
-    // Build DirectedGraph
+    // Compute best for each edge and build DirectedGraph
     DirectedGraph graph;
     uint32_t total_edges = 0;
-    for (auto& [src, dst_map] : edge_weights) {
-        for (auto& [dst, weight] : dst_map) {
-            graph.update_edge(src, dst, weight);
+    for (auto& [src, dst_map] : all_edges) {
+        for (auto& [dst, ei] : dst_map) {
+            ei.recompute_best();
+            graph.update_edge(src, dst, ei.best_weight);
             total_edges++;
         }
     }
@@ -170,36 +368,224 @@ int main(int argc, char* argv[]) {
     std::cout << "Graph built: " << graph.vertices().size() << " vertices, "
               << total_edges << " edges in " << build_ms << " ms" << std::endl;
 
-    // ── 6. Run negative cycle detection ───────────────
+    // ── 7. Run initial negative cycle detection ───────
     std::cout << "\n=== Running k=" << k << " negative cycle detection ===" << std::endl;
 
     std::vector<unsigned int> trial_seeds = {seed};
     KCycleColorCoding detector(graph, k, 1, 10, seed, 1, false);
     auto results = detector.find_most_negative_k_cycle(trial_seeds, "");
 
-    // ── 7. Output results with token addresses ────────
+    // ── 8. Simulate best cycle ────────────────────────
     if (!results.empty()) {
-        std::cout << "\n=== Arbitrage Opportunities ===" << std::endl;
-        for (size_t r = 0; r < results.size(); r++) {
-            auto& [weight, cycle] = results[r];
-            if (weight >= 0) continue; // only show profitable cycles
-
-            double profit_factor = std::exp(-weight);
-            std::cout << "\nCycle " << (r + 1) << " (weight: " << weight
-                      << ", profit factor: " << profit_factor << "):" << std::endl;
-
-            for (size_t i = 0; i < cycle.size(); i++) {
-                uint32_t nid = cycle[i];
-                std::string token = (nid < id_to_token.size()) ? id_to_token[nid] : "???";
-                std::cout << "  " << token;
-                if (token == WETH) std::cout << " (WETH)";
-                if (i < cycle.size() - 1) std::cout << " ->";
-                std::cout << std::endl;
-            }
-        }
+        json route = simulate_cycle(results[0].second, id_to_token, quote_sizes,
+                                     all_edges, all_pools, block_number);
+        // Write initial result to file
+        std::ofstream out_file("route_output.json");
+        out_file << std::setw(2) << route << std::endl;
+        out_file.close();
+        std::cout << "Route written to route_output.json" << std::endl;
     } else {
-        std::cout << "\nNo negative cycles found." << std::endl;
+        std::cout << "\nNo cycles found." << std::endl;
     }
 
+    // ── 9. Dynamic update server ──────────────────────
+    if (port <= 0) {
+        std::cout << "\nNo port specified, exiting." << std::endl;
+        return 0;
+    }
+
+    std::cout << "\n=== Starting dynamic update server on port " << port << " ===" << std::endl;
+
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        std::cerr << "socket() failed" << std::endl;
+        return 1;
+    }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        std::cerr << "bind() failed" << std::endl;
+        close(server_fd);
+        return 1;
+    }
+
+    if (listen(server_fd, 5) < 0) {
+        std::cerr << "listen() failed" << std::endl;
+        close(server_fd);
+        return 1;
+    }
+
+    std::cout << "Listening on port " << port << "..." << std::endl;
+
+    while (true) {
+        struct sockaddr_in client_addr{};
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+        if (client_fd < 0) {
+            std::cerr << "accept() failed" << std::endl;
+            continue;
+        }
+        std::cout << "Client connected." << std::endl;
+
+        // Read newline-delimited JSON from client
+        std::string buffer;
+        char chunk[4096];
+        while (true) {
+            ssize_t n = recv(client_fd, chunk, sizeof(chunk) - 1, 0);
+            if (n <= 0) break;
+            chunk[n] = '\0';
+            buffer += chunk;
+
+            // Process complete lines
+            size_t pos;
+            while ((pos = buffer.find('\n')) != std::string::npos) {
+                std::string line = buffer.substr(0, pos);
+                buffer = buffer.substr(pos + 1);
+
+                if (line.empty() || line[0] != '{') continue;
+
+                auto update_start = std::chrono::high_resolution_clock::now();
+
+                // Parse pool update
+                json entry;
+                try {
+                    entry = json::parse(line);
+                } catch (const std::exception& e) {
+                    std::cerr << "JSON parse error: " << e.what() << std::endl;
+                    continue;
+                }
+
+                Pool updated_pool;
+                try {
+                    updated_pool = parse_pool(entry);
+                } catch (const std::exception& e) {
+                    std::cerr << "Pool parse error: " << e.what() << std::endl;
+                    continue;
+                }
+
+                // Update block number
+                if (entry.contains("block")) {
+                    block_number = entry["block"].get<int64_t>();
+                }
+
+                // Find existing pool
+                auto addr_it = pool_address_to_idx.find(updated_pool.address);
+                if (addr_it == pool_address_to_idx.end()) {
+                    std::cout << "Unknown pool " << updated_pool.address << ", skipping." << std::endl;
+                    continue;
+                }
+                size_t pool_idx = addr_it->second;
+
+                // Update pool state
+                Pool& pool = all_pools[pool_idx];
+                if (pool.is_v3) {
+                    pool.sqrt_price_x96 = updated_pool.sqrt_price_x96;
+                    pool.current_tick = updated_pool.current_tick;
+                    pool.liquidity = updated_pool.liquidity;
+                    pool.ticks = updated_pool.ticks;
+                } else {
+                    pool.reserve0 = updated_pool.reserve0;
+                    pool.reserve1 = updated_pool.reserve1;
+                }
+
+                std::cout << "Updated pool " << pool.address;
+
+                // Determine if this is a WETH pool
+                bool is_weth_pool = (pool.token0 == WETH || pool.token1 == WETH);
+                std::string other_token = (pool.token0 == WETH) ? pool.token1 : pool.token0;
+
+                std::vector<std::tuple<uint32_t, uint32_t, double>> edge_changes;
+
+                if (is_weth_pool) {
+                    // WETH pool: recompute quote size for the other token
+                    double old_qs = quote_sizes.count(other_token) ? quote_sizes[other_token] : 0;
+
+                    // Recompute quote size across ALL WETH pools for this token
+                    double best_output = 0;
+                    for (size_t idx : weth_pool_indices[other_token]) {
+                        double output = get_amount_out(all_pools[idx], WETH, quote_size_wei);
+                        if (output > best_output) best_output = output;
+                    }
+                    if (best_output > 0) {
+                        quote_sizes[other_token] = best_output;
+                    }
+
+                    std::cout << " (WETH pool, qs " << other_token.substr(0, 10)
+                              << "... " << amount_to_string(old_qs) << " -> "
+                              << amount_to_string(quote_sizes[other_token]) << ")";
+
+                    // Recompute ALL edges involving this token
+                    if (token_to_id.count(other_token)) {
+                        std::unordered_set<size_t> pools_to_update;
+                        if (token_to_pool_indices.count(other_token)) {
+                            for (size_t pi : token_to_pool_indices[other_token]) {
+                                pools_to_update.insert(pi);
+                            }
+                        }
+                        for (size_t pi : pools_to_update) {
+                            auto changes = recompute_pool_edges(pi, all_pools, token_to_id,
+                                                                quote_sizes, all_edges);
+                            edge_changes.insert(edge_changes.end(), changes.begin(), changes.end());
+                        }
+                    }
+                } else {
+                    // Non-WETH pool: just recompute this pool's two edges
+                    edge_changes = recompute_pool_edges(pool_idx, all_pools, token_to_id,
+                                                        quote_sizes, all_edges);
+                }
+
+                std::cout << " -> " << edge_changes.size() << " edge(s) changed" << std::endl;
+
+                // Feed edge updates to detector
+                for (auto& [src, dst, new_weight] : edge_changes) {
+                    detector.dynamic_update_edge(src, dst, new_weight);
+                }
+
+                auto update_end = std::chrono::high_resolution_clock::now();
+                auto update_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    update_end - update_start).count();
+
+                // Build response JSON
+                json response;
+                response["weight"] = detector.current_best_weight_;
+                response["update_us"] = update_us;
+                response["edges_changed"] = edge_changes.size();
+
+                if (!detector.current_best_cycle_.empty()) {
+                    std::cout << "  Best cycle: ";
+                    for (size_t i = 0; i < detector.current_best_cycle_.size(); i++) {
+                        std::cout << detector.current_best_cycle_[i];
+                        if (i < detector.current_best_cycle_.size() - 1) std::cout << " -> ";
+                    }
+                    std::cout << " (weight=" << detector.current_best_weight_ << ")"
+                              << " [" << update_us << " us]" << std::endl;
+
+                    // Simulate and include route in response
+                    json route = simulate_cycle(detector.current_best_cycle_, id_to_token,
+                                                quote_sizes, all_edges, all_pools, block_number);
+                    response["profitable"] = route.value("profitable", false);
+                    response["route"] = route;
+                } else {
+                    response["profitable"] = false;
+                }
+
+                // Send response back to client (single line JSON + newline)
+                std::string resp_str = response.dump() + "\n";
+                send(client_fd, resp_str.c_str(), resp_str.size(), 0);
+            }
+        }
+
+        close(client_fd);
+        std::cout << "Client disconnected." << std::endl;
+    }
+
+    close(server_fd);
     return 0;
 }
