@@ -31,6 +31,11 @@ arbitrage/
 │   ├── cycle_detector.h/cpp    # k-cycle color-coding DP detection
 │   ├── directed_graph.h/cpp    # Weighted directed graph with dynamic edge updates
 │   └── CMakeLists.txt          # Build config (fetches nlohmann/json)
+├── examples/
+│   ├── run_demo.py             # Full demo script (static + dynamic + multi-process)
+│   ├── pool_update_no_arb.json # Example: unchanged pool state (no arbitrage)
+│   ├── pool_update_arb.json    # Example: 2% price shift (creates arbitrage)
+│   └── expected_output.txt     # Expected demo output for verification
 ├── graph/
 │   ├── snapshot_block_*.json   # Pool snapshot data (hex-encoded)
 │   └── example_output.json     # Example route output format

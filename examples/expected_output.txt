@@ -1,0 +1,96 @@
+Arbitrage Detection System - Demo
+============================================================
+
+============================================================
+  Demo 1: Static Detection (k=3, seed=42, 0.1 ETH)
+============================================================
+
+Loading pools from /home/yuhang/work/arbitrage/graph/snapshot_block_24589771.json...
+Parsed 695 pools in 23 ms
+WETH-connected tokens: 434
+Tokens with valid quote sizes: 427
+=== Node Mapping ===
+  ... (427 token-to-id mappings omitted) ...
+Graph built: 427 vertices, 930 edges in 1 ms
+=== Running k=3 negative cycle detection ===
+trial_seed: 42
+Trial 1:
+  Color assignment time: 0 ms
+  Total trial time: 3 ms
+  Actual trial time: 3 ms
+Current most negative cycle: 92 -> 392 -> 178 -> 92 (Weight: 0.000780741)
+batch_weight_threshold_: 5.22963e-05
+batch_size_: 1
+  Dynamic update time: 0 ms
+  Dynamic update time per update: -nan ms
+Timing totals (us): DAG_build=0, topo_sort=0, rescan_batch=0, rescan_edge=0, update_classification=0, update_edge=0
+Current most negative cycle: 92 -> 392 -> 178 -> 92 (Weight: 0.000780741)
+=== Simulating Best Cycle ===
+Start: 212762026345874948096 of 0x6b175474e89094c44da98b954eedeac495271d0f
+  Hop 1: 0x6b175474e89094c44da98b954eedeac495271d0f -> 0xdac17f958d2ee523a2206206994597c13d831ec7 via 0x48da0965ab2d2cbf1c17c09cfb5cbe67ad5b1406 (Uniswap_V3, fee=100)  in=212762026345874948096  out=212696957
+  Hop 2: 0xdac17f958d2ee523a2206206994597c13d831ec7 -> 0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2 via 0xc7bbec68d12a0d1830360f8ec58fa599ba1b0e9b (Uniswap_V3, fee=100)  in=212696957  out=99921957117067712
+  Hop 3: 0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2 -> 0x6b175474e89094c44da98b954eedeac495271d0f via 0x60594a405d53811d3bc4766596efd80fd545a270 (Uniswap_V3, fee=500)  in=99921957117067712  out=212596015509440593920
+End:   212596015509440593920 of 0x6b175474e89094c44da98b954eedeac495271d0f
+Profit: -0.0780%
+Route written to route_output.json
+No port specified, exiting.
+
+[Expected] Best cycle: DAI -> USDT -> WETH -> DAI
+[Expected] Weight: ~0.000781 (positive = no arbitrage in static snapshot)
+[Expected] Profit: ~-0.078% (small loss after fees)
+
+============================================================
+  Demo 2: Dynamic Detection (pool price shift)
+============================================================
+
+--- Sending unchanged pool (no arbitrage expected) ---
+  Weight: 0.000781
+  Profitable: False
+  Update time: 187 us
+
+--- Sending modified pool (2% sqrt_price increase) ---
+  Weight: -0.038536
+  Profitable: True
+  Update time: 277 us
+  From: 212842770 of 0xa0b86991...
+  To:   221204330 of 0xa0b86991...
+  Profit: 3.9285%
+  Hops: 3
+    1. 0xa0b86991... -> 0x6b175474... via 0x5777d92f... (Uniswap_V3)
+    2. 0x6b175474... -> 0xc02aaa39... via 0x60594a40... (Uniswap_V3)
+    3. 0xc02aaa39... -> 0xa0b86991... via 0xe0554a47... (Uniswap_V3)
+
+[Expected] Unchanged pool: weight ~0.000781, not profitable
+[Expected] Modified pool: weight ~-0.0385, profitable, ~+3.93% profit
+[Expected] Route: USDC -> DAI -> WETH -> USDC (3 hops)
+
+============================================================
+  Demo 3: Multi-Process Detection (4 detectors)
+============================================================
+
+  Launched detector: k=2 seed=42 port=11001
+  Launched detector: k=3 seed=42 port=11002
+  Launched detector: k=4 seed=42 port=11003
+  Launched detector: k=5 seed=42 port=11004
+  Waiting for detectors to start...
+
+--- Sending modified pool to all 4 detectors ---
+
+  Total wall-clock time: 6.0 ms
+
+  k=2: weight=-0.003412 profitable=False time=208us
+  k=3: weight=-0.038536 profitable=True time=574us <<< ARBITRAGE
+  k=4: weight=0.001838 profitable=False time=241us
+  k=5: weight=-0.034589 profitable=True time=1610us <<< ARBITRAGE
+
+  Best result: k=3 with 3.9285% profit
+
+[Expected] k=2: weight ~-0.003, profitable
+[Expected] k=3: weight ~-0.039, profitable (BEST)
+[Expected] k=4: weight ~+0.002, not profitable
+[Expected] k=5: weight ~-0.035, profitable
+
+============================================================
+  All demos completed!
+============================================================
+
