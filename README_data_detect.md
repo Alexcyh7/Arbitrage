@@ -1,4 +1,4 @@
-# Arbitrage-main
+# Arbitrage
 
 End-to-end arbitrage workflow on Ethereum Uniswap V2/V3:
 
@@ -27,7 +27,7 @@ pip install web3 eth_utils pandas
 Build detector once:
 
 ```bash
-cd /Arbitrage-main/detection
+cd /Arbitrage/detection
 rm -rf build
 cmake -S . -B build
 cmake --build build -j$(nproc)
@@ -64,7 +64,7 @@ export STATIC_BLOCK_BIN="/absolute/path/to/static_block"
 This is the main entrypoint and recommended mode.
 
 ```bash
-cd /Arbitrage-main
+cd /Arbitrage
 python3 examples/run_data_detection.py \
   --eth_url "$ETH_URL" \
   --stream_blocks 50 \
@@ -93,7 +93,7 @@ Outputs:
 ### A. Run Data Collection Only
 
 ```bash
-cd /Arbitrage-main/data_collection
+cd /Arbitrage/data_collection
 python3 run_full_pipeline.py \
   --eth_url "$ETH_URL" \
   --stream_blocks 50 \
@@ -124,7 +124,7 @@ Collection outputs:
 ### B. Run Detection Only (Replay Existing Data)
 
 ```bash
-cd /Arbitrage-main
+cd /Arbitrage
 python3 examples/run_data_detection.py --skip_collection
 ```
 
@@ -133,7 +133,7 @@ Custom output folder:
 ```bash
 python3 examples/run_data_detection.py \
   --skip_collection \
-  --results_dir "/Arbitrage-main/cycles_results_custom"
+  --results_dir "/Arbitrage/cycles_results_custom"
 ```
 
 If you explicitly want old sequential behavior (collect first, then replay):
@@ -160,7 +160,7 @@ python3 examples/run_data_detection.py --sequential --eth_url "$ETH_URL"
 ## 6) Minimal Smoke Test
 
 ```bash
-cd /Arbitrage-main
+cd /Arbitrage
 python3 examples/run_data_detection.py \
   --eth_url "$ETH_URL" \
   --stream_blocks 5 \
