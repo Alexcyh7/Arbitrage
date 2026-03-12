@@ -1,0 +1,15 @@
+[package]
+name = "static_block"
+version = "0.1.0"
+edition = "2021"
+description = "Crawl Uniswap V2 and V3 pool snapshots at a given block (standalone, Tycho RPC only)"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing-subscriber = "0.3"
+tycho-client = ">=0.133.0"
+tycho-common = ">=0.133.0"

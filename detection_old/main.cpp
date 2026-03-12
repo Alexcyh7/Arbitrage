@@ -206,70 +206,10 @@ std::vector<std::tuple<uint32_t, uint32_t, double>> recompute_pool_edges(
     return changed;
 }
 
-inline double json_number_to_double(const json& value) {
-    try {
-        if (value.is_number_float()) return value.get<double>();
-        if (value.is_number_integer()) return static_cast<double>(value.get<int64_t>());
-        if (value.is_number_unsigned()) return static_cast<double>(value.get<uint64_t>());
-        if (value.is_string()) return std::stod(value.get<std::string>());
-    } catch (...) {
-    }
-    return 0.0;
-}
-
-std::vector<std::tuple<uint32_t, uint32_t, double>> apply_pool_state_and_recompute(
-    size_t pool_idx,
-    std::vector<Pool>& all_pools,
-    const std::unordered_map<std::string, uint32_t>& token_to_id,
-    const std::unordered_map<std::string, std::vector<size_t>>& token_to_pool_indices,
-    const std::unordered_map<std::string, std::vector<size_t>>& weth_pool_indices,
-    std::unordered_map<std::string, double>& quote_sizes,
-    double quote_size_wei,
-    EdgeMap& all_edges)
-{
-    std::vector<std::tuple<uint32_t, uint32_t, double>> edge_changes;
-    auto& pool = all_pools[pool_idx];
-
-    bool is_weth_pool = (pool.token0 == WETH || pool.token1 == WETH);
-    std::string other_token = (pool.token0 == WETH) ? pool.token1 : pool.token0;
-
-    if (is_weth_pool) {
-        // WETH pool: quote size of the paired token may change.
-        double best_output = 0;
-        auto it = weth_pool_indices.find(other_token);
-        if (it != weth_pool_indices.end()) {
-            for (size_t idx : it->second) {
-                double output = get_amount_out(all_pools[idx], WETH, quote_size_wei);
-                if (output > best_output) best_output = output;
-            }
-        }
-        if (best_output > 0) {
-            quote_sizes[other_token] = best_output;
-        }
-
-        // Quote size changed => all pools touching that token need recompute.
-        if (token_to_id.count(other_token) && token_to_pool_indices.count(other_token)) {
-            std::unordered_set<size_t> pools_to_update;
-            for (size_t pi : token_to_pool_indices.at(other_token)) {
-                pools_to_update.insert(pi);
-            }
-            for (size_t pi : pools_to_update) {
-                auto changes = recompute_pool_edges(pi, all_pools, token_to_id, quote_sizes, all_edges);
-                edge_changes.insert(edge_changes.end(), changes.begin(), changes.end());
-            }
-        }
-    } else {
-        // Non-WETH pool: only this pool's two directions may change.
-        edge_changes = recompute_pool_edges(pool_idx, all_pools, token_to_id, quote_sizes, all_edges);
-    }
-
-    return edge_changes;
-}
-
 int main(int argc, char* argv[]) {
     if (argc < 4) {
         std::cerr << "Usage: " << argv[0]
-                  << " <json_file> <seed> <quote_size_eth> [port] [k] [num_trials]"
+                  << " <json_file> <seed> <quote_size_eth> [port] [k]"
                   << std::endl;
         return 1;
     }
@@ -279,11 +219,6 @@ int main(int argc, char* argv[]) {
     double quote_size_eth = std::stod(argv[3]);
     int port = argc > 4 ? std::stoi(argv[4]) : 0;
     int k = argc > 5 ? std::stoi(argv[5]) : 3;
-    int num_trials = argc > 6 ? std::stoi(argv[6]) : 1;
-    if (num_trials <= 0) {
-        std::cerr << "num_trials must be >= 1" << std::endl;
-        return 1;
-    }
 
     double quote_size_wei = quote_size_eth * 1e18;
 
@@ -435,15 +370,9 @@ int main(int argc, char* argv[]) {
 
     // ── 7. Run initial negative cycle detection ───────
     std::cout << "\n=== Running k=" << k << " negative cycle detection ===" << std::endl;
-    std::cout << "Trials: " << num_trials << " (base seed: " << seed << ")" << std::endl;
 
-    std::vector<unsigned int> trial_seeds;
-    trial_seeds.reserve(static_cast<size_t>(num_trials));
-    for (int i = 0; i < num_trials; i++) {
-        trial_seeds.push_back(seed + static_cast<unsigned int>(i));
-    }
-
-    KCycleColorCoding detector(graph, k, static_cast<uint>(num_trials), 10, seed, 1, false);
+    std::vector<unsigned int> trial_seeds = {seed};
+    KCycleColorCoding detector(graph, k, 1, 10, seed, 1, false);
     auto results = detector.find_most_negative_k_cycle(trial_seeds, "");
 
     // ── 8. Simulate best cycle ────────────────────────
@@ -533,110 +462,86 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
-                std::vector<std::tuple<uint32_t, uint32_t, double>> edge_changes;
-                size_t events_seen = 0;
-                size_t events_applied = 0;
+                Pool updated_pool;
+                try {
+                    updated_pool = parse_pool(entry);
+                } catch (const std::exception& e) {
+                    std::cerr << "Pool parse error: " << e.what() << std::endl;
+                    continue;
+                }
 
-                // Update block number (legacy single-pool format)
+                // Update block number
                 if (entry.contains("block")) {
                     block_number = entry["block"].get<int64_t>();
                 }
-                // Update block number (batch event format)
-                if (entry.contains("block_info") && entry["block_info"].contains("block_number")) {
-                    block_number = entry["block_info"]["block_number"].get<int64_t>();
+
+                // Find existing pool
+                auto addr_it = pool_address_to_idx.find(updated_pool.address);
+                if (addr_it == pool_address_to_idx.end()) {
+                    std::cout << "Unknown pool " << updated_pool.address << ", skipping." << std::endl;
+                    continue;
                 }
+                size_t pool_idx = addr_it->second;
 
-                if (entry.contains("events") && entry["events"].is_array()) {
-                    // New dynamic format: a batch with multiple events.
-                    for (const auto& ev : entry["events"]) {
-                        events_seen++;
-                        if (!ev.contains("parsed_event") || !ev["parsed_event"].is_object()) continue;
-                        const auto& parsed_event = ev["parsed_event"];
-                        std::string event_type = parsed_event.value("event_type", "");
-
-                        std::string pool_address;
-                        if (ev.contains("pair_address")) {
-                            pool_address = str_to_lower(ev["pair_address"].get<std::string>());
-                        } else if (ev.contains("pool_address")) {
-                            pool_address = str_to_lower(ev["pool_address"].get<std::string>());
-                        } else {
-                            continue;
-                        }
-
-                        auto addr_it = pool_address_to_idx.find(pool_address);
-                        // Requirement: only update if the pool already exists in our map.
-                        if (addr_it == pool_address_to_idx.end()) continue;
-
-                        if (ev.contains("block_number")) {
-                            block_number = ev["block_number"].get<int64_t>();
-                        }
-
-                        size_t pool_idx = addr_it->second;
-                        Pool& pool = all_pools[pool_idx];
-
-                        if (!pool.is_v3) {
-                            // v2 dynamic stream: only Sync events update reserves.
-                            if (event_type != "Sync") continue;
-                            if (!parsed_event.contains("reserve0") || !parsed_event.contains("reserve1")) continue;
-                            pool.reserve0 = json_number_to_double(parsed_event["reserve0"]);
-                            pool.reserve1 = json_number_to_double(parsed_event["reserve1"]);
-                        } else {
-                            // v3 dynamic stream: update on events carrying current state values.
-                            if (!parsed_event.contains("sqrtPriceX96") ||
-                                !parsed_event.contains("liquidity") ||
-                                !parsed_event.contains("tick")) {
-                                continue;
-                            }
-                            pool.sqrt_price_x96 = json_number_to_double(parsed_event["sqrtPriceX96"]);
-                            pool.liquidity = json_number_to_double(parsed_event["liquidity"]);
-                            pool.current_tick = static_cast<int>(json_number_to_double(parsed_event["tick"]));
-                        }
-
-                        auto changes = apply_pool_state_and_recompute(
-                            pool_idx, all_pools, token_to_id, token_to_pool_indices,
-                            weth_pool_indices, quote_sizes, quote_size_wei, all_edges);
-                        edge_changes.insert(edge_changes.end(), changes.begin(), changes.end());
-                        events_applied++;
-                    }
-                    std::cout << "Processed event batch: " << events_applied << "/" << events_seen
-                              << " event(s) applied, " << edge_changes.size() << " edge(s) changed"
-                              << std::endl;
+                // Update pool state
+                Pool& pool = all_pools[pool_idx];
+                if (pool.is_v3) {
+                    pool.sqrt_price_x96 = updated_pool.sqrt_price_x96;
+                    pool.current_tick = updated_pool.current_tick;
+                    pool.liquidity = updated_pool.liquidity;
+                    pool.ticks = updated_pool.ticks;
                 } else {
-                    // Legacy format: single snapshot-style pool entry.
-                    events_seen = 1;
-                    Pool updated_pool;
-                    try {
-                        updated_pool = parse_pool(entry);
-                    } catch (const std::exception& e) {
-                        std::cerr << "Pool parse error: " << e.what() << std::endl;
-                        continue;
-                    }
-
-                    auto addr_it = pool_address_to_idx.find(updated_pool.address);
-                    if (addr_it == pool_address_to_idx.end()) {
-                        std::cout << "Unknown pool " << updated_pool.address << ", skipping." << std::endl;
-                        continue;
-                    }
-                    size_t pool_idx = addr_it->second;
-
-                    Pool& pool = all_pools[pool_idx];
-                    if (pool.is_v3) {
-                        pool.sqrt_price_x96 = updated_pool.sqrt_price_x96;
-                        pool.current_tick = updated_pool.current_tick;
-                        pool.liquidity = updated_pool.liquidity;
-                        pool.ticks = updated_pool.ticks;
-                    } else {
-                        pool.reserve0 = updated_pool.reserve0;
-                        pool.reserve1 = updated_pool.reserve1;
-                    }
-
-                    edge_changes = apply_pool_state_and_recompute(
-                        pool_idx, all_pools, token_to_id, token_to_pool_indices,
-                        weth_pool_indices, quote_sizes, quote_size_wei, all_edges);
-                    events_applied = 1;
-                    std::cout << "Processed single pool update: " << edge_changes.size()
-                              << " edge(s) changed" << std::endl;
+                    pool.reserve0 = updated_pool.reserve0;
+                    pool.reserve1 = updated_pool.reserve1;
                 }
+
+                std::cout << "Updated pool " << pool.address;
+
+                // Determine if this is a WETH pool
+                bool is_weth_pool = (pool.token0 == WETH || pool.token1 == WETH);
+                std::string other_token = (pool.token0 == WETH) ? pool.token1 : pool.token0;
+
+                std::vector<std::tuple<uint32_t, uint32_t, double>> edge_changes;
+
+                if (is_weth_pool) {
+                    // WETH pool: recompute quote size for the other token
+                    double old_qs = quote_sizes.count(other_token) ? quote_sizes[other_token] : 0;
+
+                    // Recompute quote size across ALL WETH pools for this token
+                    double best_output = 0;
+                    for (size_t idx : weth_pool_indices[other_token]) {
+                        double output = get_amount_out(all_pools[idx], WETH, quote_size_wei);
+                        if (output > best_output) best_output = output;
+                    }
+                    if (best_output > 0) {
+                        quote_sizes[other_token] = best_output;
+                    }
+
+                    std::cout << " (WETH pool, qs " << other_token.substr(0, 10)
+                              << "... " << amount_to_string(old_qs) << " -> "
+                              << amount_to_string(quote_sizes[other_token]) << ")";
+
+                    // Recompute ALL edges involving this token
+                    if (token_to_id.count(other_token)) {
+                        std::unordered_set<size_t> pools_to_update;
+                        if (token_to_pool_indices.count(other_token)) {
+                            for (size_t pi : token_to_pool_indices[other_token]) {
+                                pools_to_update.insert(pi);
+                            }
+                        }
+                        for (size_t pi : pools_to_update) {
+                            auto changes = recompute_pool_edges(pi, all_pools, token_to_id,
+                                                                quote_sizes, all_edges);
+                            edge_changes.insert(edge_changes.end(), changes.begin(), changes.end());
+                        }
+                    }
+                } else {
+                    // Non-WETH pool: just recompute this pool's two edges
+                    edge_changes = recompute_pool_edges(pool_idx, all_pools, token_to_id,
+                                                        quote_sizes, all_edges);
+                }
+
+                std::cout << " -> " << edge_changes.size() << " edge(s) changed" << std::endl;
 
                 // Feed edge updates to detector
                 for (auto& [src, dst, new_weight] : edge_changes) {
@@ -652,8 +557,6 @@ int main(int argc, char* argv[]) {
                 response["weight"] = detector.current_best_weight_;
                 response["update_us"] = update_us;
                 response["edges_changed"] = edge_changes.size();
-                response["events_seen"] = events_seen;
-                response["events_applied"] = events_applied;
 
                 if (!detector.current_best_cycle_.empty()) {
                     std::cout << "  Best cycle: ";

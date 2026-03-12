@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <iomanip>
 #include <vector>
-#include <functional>
 
 using CycleInfo = std::pair<double, std::vector<uint32_t>>;
 using CycleInfoCmp = std::function<bool(const CycleInfo&, const CycleInfo&)>;

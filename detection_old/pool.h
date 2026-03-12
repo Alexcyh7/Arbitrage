@@ -85,13 +85,7 @@ struct Pool {
 
 inline Pool parse_pool(const json& entry) {
     Pool pool;
-    if (entry.contains("component") &&
-        entry["component"].contains("static_attributes") &&
-        entry["component"]["static_attributes"].contains("pool_address")) {
-        pool.address = str_to_lower(entry["component"]["static_attributes"]["pool_address"].get<std::string>());
-    } else {
-        pool.address = str_to_lower(entry["component"]["id"].get<std::string>());
-    }
+    pool.address = str_to_lower(entry["component"]["id"].get<std::string>());
 
     auto& tokens = entry["component"]["tokens"];
     pool.token0 = str_to_lower(tokens[0].get<std::string>());
