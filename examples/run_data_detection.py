@@ -26,9 +26,17 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COLLECTOR = os.path.join(ROOT, "data_collection", "run_full_pipeline.py")
 DATA_OUTPUT = os.path.join(ROOT, "data_collection", "output")
-DETECT_BIN = os.path.join(ROOT, "detection", "build", "detect")
+DETECT_BIN_CC = os.path.join(ROOT, "detection", "build", "detect")
+DETECT_BIN_HP = os.path.join(ROOT, "detection_graphs", "build", "detect_graphs")
 ROUTE_OUTPUT = os.path.join(ROOT, "route_output.json")
 DEFAULT_RESULTS_DIR = os.path.join(ROOT, "cycles_results")
+
+
+def _get_detector_bin(algorithm):
+    """Return the binary path for the selected algorithm."""
+    if algorithm == "hp-index":
+        return DETECT_BIN_HP
+    return DETECT_BIN_CC
 
 
 def wait_for_port(port, timeout=20):
@@ -89,13 +97,19 @@ def _latest_matching_file(pattern):
     return max(files, key=os.path.getmtime)
 
 
-def _start_detector(snapshot_path, seed, quote_size_eth, port, k):
+def _start_detector(snapshot_path, seed, quote_size_eth, port, k, algorithm="color-coding", hp_threshold=10):
+    detect_bin = _get_detector_bin(algorithm)
+    # Both binaries: <json_file> <seed> <quote_size_eth> <port> <k> <extra>
+    # color-coding extra = num_trials (default 1), hp-index extra = hp_threshold
+    extra_arg = str(hp_threshold) if algorithm == "hp-index" else "1"
+    cmd = [detect_bin, snapshot_path, str(seed), str(quote_size_eth), str(port), str(k), extra_arg]
+    algo_label = "hp-index" if algorithm == "hp-index" else "color-coding"
     print(
-        f"[detect] start: {DETECT_BIN} {snapshot_path} {seed} {quote_size_eth} {port} {k}",
+        f"[detect] start ({algo_label}): {' '.join(cmd)}",
         flush=True,
     )
     proc = subprocess.Popen(
-        [DETECT_BIN, snapshot_path, str(seed), str(quote_size_eth), str(port), str(k)],
+        cmd,
         stdout=None,
         stderr=None,
         preexec_fn=os.setsid,
@@ -222,7 +236,8 @@ def run_collection_and_detection_interleaved(args):
                     if os.path.exists(snapshot_path):
                         _stop_detector(detector_proc)
                         detector_proc = _start_detector(
-                            snapshot_path, args.seed, args.quote_size_eth, args.port, args.k
+                            snapshot_path, args.seed, args.quote_size_eth, args.port, args.k,
+                            algorithm=args.algorithm, hp_threshold=args.hp_threshold,
                         )
                         current_snapshot_block = block
                         print(f"[detect] graph reset at block {block}", flush=True)
@@ -230,6 +245,7 @@ def run_collection_and_detection_interleaved(args):
                         static_result = {
                             "block_number": block,
                             "phase": "static_detect_cycle",
+                            "algorithm": args.algorithm,
                             "snapshot_file": snapshot_path,
                             "timestamp": datetime.datetime.now().isoformat(),
                         }
@@ -280,6 +296,7 @@ def run_collection_and_detection_interleaved(args):
                 result = {
                     "block_number": block,
                     "phase": "dynamic_detect_arbitrage_cycle",
+                    "algorithm": args.algorithm,
                     "snapshot_block_in_use": current_snapshot_block,
                     "v2_events_file": v2_path,
                     "v3_events_file": v3_path,
@@ -366,7 +383,10 @@ def run_detection_replay(args):
             snapshot_path = snapshot_by_block.get(block)
             if snapshot_path:
                 _stop_detector(detector_proc)
-                detector_proc = _start_detector(snapshot_path, args.seed, args.quote_size_eth, args.port, args.k)
+                detector_proc = _start_detector(
+                    snapshot_path, args.seed, args.quote_size_eth, args.port, args.k,
+                    algorithm=args.algorithm, hp_threshold=args.hp_threshold,
+                )
                 current_snapshot_block = block
                 snapshot_reset = True
                 print(f"[block {block}] reset graph from {os.path.basename(snapshot_path)}")
@@ -483,6 +503,18 @@ def parse_args():
         action="store_true",
         help="Run collection first then replay (default is interleaved real-time mode).",
     )
+    parser.add_argument(
+        "--algorithm",
+        choices=["color-coding", "hp-index"],
+        default="color-coding",
+        help="Detection algorithm: 'color-coding' (randomized DP) or 'hp-index' (GraphS deterministic). Default: color-coding.",
+    )
+    parser.add_argument(
+        "--hp_threshold",
+        type=int,
+        default=10,
+        help="Hot-point degree threshold for hp-index algorithm (default: 10). Ignored for color-coding.",
+    )
     return parser.parse_args()
 
 
@@ -505,10 +537,17 @@ def main():
     if not os.path.exists(COLLECTOR):
         print(f"ERROR: collector script not found: {COLLECTOR}")
         sys.exit(1)
-    if not os.path.exists(DETECT_BIN):
-        print(f"ERROR: detector binary not found: {DETECT_BIN}")
-        print("Build it first: cd detection && mkdir -p build && cd build && cmake .. && make -j$(nproc)")
+
+    detect_bin = _get_detector_bin(args.algorithm)
+    if not os.path.exists(detect_bin):
+        print(f"ERROR: detector binary not found: {detect_bin}")
+        if args.algorithm == "hp-index":
+            print("Build it first: cd detection_graphs && mkdir -p build && cd build && cmake .. && make -j$(nproc)")
+        else:
+            print("Build it first: cd detection && mkdir -p build && cd build && cmake .. && make -j$(nproc)")
         sys.exit(1)
+
+    print(f"Algorithm: {args.algorithm}", flush=True)
 
     if args.skip_collection:
         print("Skipping collection; using existing data output.")
