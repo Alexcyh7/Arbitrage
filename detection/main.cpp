@@ -18,8 +18,59 @@
 #include <netinet/in.h>
 #include <unistd.h>
 #include <cstring>
+#include <climits>
 
 const std::string WETH = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2";
+
+// ──────────────────────────────────────────────
+//  Token ranking: determines starting node of cycle output
+// ──────────────────────────────────────────────
+// Lower rank value = higher priority. Tokens not in file get rank INT_MAX.
+std::unordered_map<std::string, int> token_rank;
+
+void load_token_ranking(const std::string& path) {
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        std::cout << "No token ranking file found at " << path << ", using default order." << std::endl;
+        return;
+    }
+    std::string address, symbol;
+    int rank = 0;
+    while (f >> address >> symbol) {
+        token_rank[str_to_lower(address)] = rank++;
+    }
+    std::cout << "Loaded token ranking: " << token_rank.size() << " tokens" << std::endl;
+}
+
+// Rotate cycle so the highest-ranked (lowest rank value) token is first.
+// cycle format: [v0, v1, ..., vn, v0] where first == last
+std::vector<uint32_t> rotate_cycle_by_rank(
+    const std::vector<uint32_t>& cycle,
+    const std::vector<std::string>& id_to_token)
+{
+    if (cycle.size() < 2) return cycle;
+    size_t n = cycle.size() - 1;  // exclude repeated last element
+
+    int best_rank = INT_MAX;
+    size_t best_pos = 0;
+    for (size_t i = 0; i < n; i++) {
+        const std::string& token = id_to_token[cycle[i]];
+        auto it = token_rank.find(token);
+        int r = (it != token_rank.end()) ? it->second : INT_MAX;
+        if (r < best_rank) {
+            best_rank = r;
+            best_pos = i;
+        }
+    }
+
+    // Rotate
+    std::vector<uint32_t> rotated;
+    for (size_t i = 0; i < n; i++) {
+        rotated.push_back(cycle[(best_pos + i) % n]);
+    }
+    rotated.push_back(rotated[0]);  // close the cycle
+    return rotated;
+}
 
 // Convert double to integer string (no scientific notation)
 inline std::string amount_to_string(double val) {
@@ -70,7 +121,7 @@ inline double compute_edge_weight(
 //  Simulate a cycle and return route JSON
 // ──────────────────────────────────────────────
 json simulate_cycle(
-    const std::vector<uint32_t>& cycle,
+    const std::vector<uint32_t>& raw_cycle,
     const std::vector<std::string>& id_to_token,
     const std::unordered_map<std::string, double>& quote_sizes,
     const EdgeMap& all_edges,
@@ -80,7 +131,10 @@ json simulate_cycle(
     json result;
     result["profitable"] = false;
 
-    if (cycle.size() < 2) return result;
+    if (raw_cycle.size() < 2) return result;
+
+    // Rotate cycle so highest-ranked token is first
+    auto cycle = rotate_cycle_by_rank(raw_cycle, id_to_token);
 
     std::string start_token = id_to_token[cycle[0]];
     auto qs_it = quote_sizes.find(start_token);
@@ -286,6 +340,18 @@ int main(int argc, char* argv[]) {
     }
 
     double quote_size_wei = quote_size_eth * 1e18;
+
+    // ── 0. Load token ranking (look next to json_file, then cwd) ──
+    {
+        // Try: same directory as json_file
+        std::string dir = json_file.substr(0, json_file.find_last_of("/\\") + 1);
+        std::string rank_path = dir + "token_ranking.txt";
+        std::ifstream test(rank_path);
+        if (!test.is_open()) {
+            rank_path = "token_ranking.txt";  // fallback: cwd
+        }
+        load_token_ranking(rank_path);
+    }
 
     // ── 1. Load and parse JSON ────────────────────────
     std::cout << "Loading pools from " << json_file << "..." << std::endl;
