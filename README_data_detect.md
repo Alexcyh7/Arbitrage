@@ -24,13 +24,20 @@ Install Python deps:
 pip install web3 eth_utils pandas
 ```
 
-Build detector once:
+Build detectors:
 
 ```bash
+# Color-coding detector
 cd /Arbitrage/detection
-rm -rf build
-cmake -S . -B build
-cmake --build build -j$(nproc)
+mkdir -p build && cd build
+cmake .. && make -j$(nproc)
+cd ../..
+
+# HP-Index (GraphS) detector
+cd /Arbitrage/detection_graphs
+mkdir -p build && cd build
+cmake .. && make -j$(nproc)
+cd ../..
 ```
 
 ---
@@ -65,6 +72,8 @@ This is the main entrypoint and recommended mode.
 
 ```bash
 cd /Arbitrage
+
+# Using color-coding (default)
 python3 examples/run_data_detection.py \
   --eth_url "$ETH_URL" \
   --stream_blocks 50 \
@@ -74,7 +83,24 @@ python3 examples/run_data_detection.py \
   --k 3 \
   --seed 42 \
   --quote_size_eth 0.1
+
+# Using HP-Index (GraphS, deterministic, faster dynamic updates)
+python3 examples/run_data_detection.py \
+  --eth_url "$ETH_URL" \
+  --stream_blocks 50 \
+  --poll_interval 0.2 \
+  --snapshot_interval 10 \
+  --tvl_gt 100 \
+  --k 3 \
+  --seed 42 \
+  --quote_size_eth 0.1 \
+  --algorithm hp-index \
+  --hp_threshold 10
 ```
+
+Algorithm options:
+- `--algorithm color-coding` (default) — randomized DP, multiple seeds improve coverage
+- `--algorithm hp-index` — deterministic, ~2-2.5x faster dynamic updates, with `--hp_threshold` (default 10)
 
 Behavior:
 
