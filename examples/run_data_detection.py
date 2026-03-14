@@ -98,6 +98,7 @@ def _latest_matching_file(pattern):
 
 
 def _start_detector(snapshot_path, seed, quote_size_eth, port, k, algorithm="color-coding", hp_threshold=10):
+    _ensure_port_available(port)
     detect_bin = _get_detector_bin(algorithm)
     # Both binaries: <json_file> <seed> <quote_size_eth> <port> <k> <extra>
     # color-coding extra = num_trials (default 1), hp-index extra = hp_threshold
@@ -125,6 +126,58 @@ def _start_detector(snapshot_path, seed, quote_size_eth, port, k, algorithm="col
     return proc
 
 
+def _ensure_port_available(port):
+    """Best-effort cleanup for stale detector processes holding the port."""
+    if port <= 0:
+        return
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.settimeout(0.3)
+        in_use = probe.connect_ex(("127.0.0.1", port)) == 0
+        probe.close()
+    except Exception:
+        in_use = True
+    if not in_use:
+        return
+
+    try:
+        out = subprocess.check_output(["ss", "-ltnp"], text=True, stderr=subprocess.STDOUT)
+    except Exception:
+        return
+
+    pids = set()
+    for line in out.splitlines():
+        if f":{port} " not in line:
+            continue
+        pids.update(int(x) for x in re.findall(r"pid=(\d+)", line))
+
+    if not pids:
+        return
+
+    print(f"[detect][port] port {port} is busy, cleaning pids={sorted(pids)}", flush=True)
+    for pid in sorted(pids):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            continue
+
+    time.sleep(0.4)
+
+    for pid in sorted(pids):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except Exception:
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+
 def _stop_detector(proc):
     if not proc:
         return
@@ -150,6 +203,8 @@ def run_collection(args):
         "--tvl_gt",
         str(args.tvl_gt),
     ]
+    if args.start_block is not None:
+        cmd.extend(["--start_block", str(args.start_block)])
     if args.allow_dynamic_only:
         cmd.append("--allow_dynamic_only")
 
@@ -196,6 +251,8 @@ def run_collection_and_detection_interleaved(args):
         "--tvl_gt",
         str(args.tvl_gt),
     ]
+    if args.start_block is not None:
+        cmd.extend(["--start_block", str(args.start_block)])
     if args.allow_dynamic_only:
         cmd.append("--allow_dynamic_only")
 
@@ -368,7 +425,11 @@ def run_detection_replay(args):
     min_block = min(snapshot_by_block.keys())
     max_block = max(set(snapshot_by_block.keys()) | set(v2_by_block.keys()) | set(v3_by_block.keys()))
 
-    print(f"Replay block range: {min_block} -> {max_block}")
+    replay_start_block = min_block
+    if args.start_block is not None:
+        replay_start_block = max(min_block, args.start_block)
+
+    print(f"Replay block range: {replay_start_block} -> {max_block}")
     print(
         f"Snapshots={len(snapshot_by_block)} "
         f"V2_blocks={len(v2_by_block)} V3_blocks={len(v3_by_block)}"
@@ -376,12 +437,28 @@ def run_detection_replay(args):
 
     detector_proc = None
     current_snapshot_block = None
+    preloaded_snapshot_block = None
+
+    if replay_start_block > min_block:
+        candidate_snapshot_blocks = [b for b in snapshot_by_block.keys() if b <= replay_start_block]
+        if candidate_snapshot_blocks:
+            preloaded_snapshot_block = max(candidate_snapshot_blocks)
+            preload_snapshot_path = snapshot_by_block[preloaded_snapshot_block]
+            detector_proc = _start_detector(
+                preload_snapshot_path, args.seed, args.quote_size_eth, args.port, args.k,
+                algorithm=args.algorithm, hp_threshold=args.hp_threshold,
+            )
+            current_snapshot_block = preloaded_snapshot_block
+            print(
+                f"[replay] preloaded snapshot block {preloaded_snapshot_block} "
+                f"for start block {replay_start_block}"
+            )
 
     try:
-        for block in range(min_block, max_block + 1):
+        for block in range(replay_start_block, max_block + 1):
             snapshot_reset = False
             snapshot_path = snapshot_by_block.get(block)
-            if snapshot_path:
+            if snapshot_path and block != preloaded_snapshot_block:
                 _stop_detector(detector_proc)
                 detector_proc = _start_detector(
                     snapshot_path, args.seed, args.quote_size_eth, args.port, args.k,
@@ -498,6 +575,12 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Detector seed.")
     parser.add_argument("--quote_size_eth", type=float, default=0.1, help="Detector quote size in ETH.")
     parser.add_argument("--k", type=int, default=3, help="Cycle length parameter k.")
+    parser.add_argument(
+        "--start_block",
+        type=int,
+        default=None,
+        help="Optional fixed start block. For collection: bootstrap snapshot block; streaming starts from next block. For replay: start replay from this block.",
+    )
     parser.add_argument(
         "--sequential",
         action="store_true",

@@ -150,9 +150,11 @@ def _tick_from_price(price: Decimal) -> int:
 
 
 def _sqrt_price_from_tick(tick: int) -> Decimal:
-    return (Decimal('1.0001') ** (Decimal(tick) / 2)).quantize(
+    # Keep strictly positive to avoid division-by-zero in extreme low ticks.
+    sp = (Decimal('1.0001') ** (Decimal(tick) / 2)).quantize(
         Decimal('1e-18'), rounding=ROUND_DOWN
     )
+    return sp if sp > Decimal('0') else Decimal('1e-18')
 
 
 def _parse_v3_ticks(attrs: dict):
@@ -203,20 +205,21 @@ def _v3_swap(pool: dict, input_token: str, amount_in: int):
 
     attrs = pool["state"]["attributes"]
     fee = _hex_to_uint(pool["component"]["static_attributes"]["fee"])
-    fee_rate = Decimal(fee) / Decimal(1_000_000)
+    fee_rate = float(fee) / 1_000_000.0
 
-    sp_current = _sqrt_price_x96_to_decimal(_hex_to_uint(attrs["sqrt_price_x96"]))
-    if sp_current <= Decimal('1e-18'):
-        sp_current = Decimal('1e-18')
+    # Align with detector C++ math (double path) to avoid large route drift.
+    sp_current = float(_hex_to_uint(attrs["sqrt_price_x96"])) / float(Q96)
+    if sp_current <= 1e-30:
+        sp_current = 1e-30
 
-    L = Decimal(_hex_to_uint(attrs["liquidity"]))
+    L = float(_hex_to_uint(attrs["liquidity"]))
     current_tick = _hex_to_int(attrs["tick"])
 
-    all_ticks = _parse_v3_ticks(attrs)
+    all_ticks = [(idx, float(nl)) for idx, nl in _parse_v3_ticks(attrs)]
 
-    amount_remaining = Decimal(amount_in)
-    amount_out = Decimal(0)
-    EPSILON = Decimal('1e-18')
+    amount_remaining = float(amount_in)
+    amount_out = 0.0
+    EPSILON = 1e-18
 
     if zero_for_one:
         # token0 -> token1: price decreases, walk ticks downward
@@ -229,33 +232,31 @@ def _v3_swap(pool: dict, input_token: str, amount_in: int):
             if amount_remaining <= 0:
                 break
 
-            sp_target = _sqrt_price_from_tick(tick_idx)
-            if sp_target >= sp_current:
+            sp_target_f = math.pow(1.0001, tick_idx / 2.0)
+            if sp_target_f >= sp_current:
                 continue
 
-            if L < EPSILON:
+            if L <= EPSILON:
                 break
-            dx_net = L * (sp_current - sp_target) / (sp_current * sp_target)
-            dx_gross = dx_net / (Decimal(1) - fee_rate)
+            dx_net = L * (sp_current - sp_target_f) / (sp_current * sp_target_f)
+            dx_gross = dx_net / (1.0 - fee_rate)
 
             if amount_remaining >= dx_gross:
-                dy = L * (sp_current - sp_target)
+                dy = L * (sp_current - sp_target_f)
                 amount_out += dy
                 amount_remaining -= dx_gross
-                sp_current = sp_target
-                L -= Decimal(net_liq)
+                sp_current = sp_target_f
+                L -= net_liq
             else:
-                dx_net_avail = amount_remaining * (Decimal(1) - fee_rate)
+                dx_net_avail = amount_remaining * (1.0 - fee_rate)
                 sp_new = (L * sp_current) / (L + dx_net_avail * sp_current)
-                sp_new = sp_new.quantize(Decimal('1e-18'), rounding=ROUND_DOWN)
                 amount_out += L * (sp_current - sp_new)
-                amount_remaining = Decimal(0)
+                amount_remaining = 0.0
                 sp_current = sp_new
 
-        if amount_remaining > 0 and L >= EPSILON:
-            dx_net_avail = amount_remaining * (Decimal(1) - fee_rate)
+        if amount_remaining > 0 and L > EPSILON:
+            dx_net_avail = amount_remaining * (1.0 - fee_rate)
             sp_new = (L * sp_current) / (L + dx_net_avail * sp_current)
-            sp_new = sp_new.quantize(Decimal('1e-18'), rounding=ROUND_DOWN)
             amount_out += L * (sp_current - sp_new)
             sp_current = sp_new
 
@@ -270,45 +271,43 @@ def _v3_swap(pool: dict, input_token: str, amount_in: int):
             if amount_remaining <= 0:
                 break
 
-            sp_target = _sqrt_price_from_tick(tick_idx)
-            if sp_target <= sp_current:
+            sp_target_f = math.pow(1.0001, tick_idx / 2.0)
+            if sp_target_f <= sp_current:
                 continue
 
-            if L < EPSILON:
+            if L <= EPSILON:
                 break
-            dy_net = L * (sp_target - sp_current)
-            dy_gross = dy_net / (Decimal(1) - fee_rate)
+            dy_net = L * (sp_target_f - sp_current)
+            dy_gross = dy_net / (1.0 - fee_rate)
 
             if amount_remaining >= dy_gross:
-                dx = L * (Decimal(1) / sp_current - Decimal(1) / sp_target)
+                dx = L * (1.0 / sp_current - 1.0 / sp_target_f)
                 amount_out += dx
                 amount_remaining -= dy_gross
-                sp_current = sp_target
-                L += Decimal(net_liq)
+                sp_current = sp_target_f
+                L += net_liq
             else:
-                dy_net_avail = amount_remaining * (Decimal(1) - fee_rate)
+                dy_net_avail = amount_remaining * (1.0 - fee_rate)
                 sp_new = sp_current + dy_net_avail / L
-                sp_new = sp_new.quantize(Decimal('1e-18'), rounding=ROUND_DOWN)
-                amount_out += L * (Decimal(1) / sp_current - Decimal(1) / sp_new)
-                amount_remaining = Decimal(0)
+                amount_out += L * (1.0 / sp_current - 1.0 / sp_new)
+                amount_remaining = 0.0
                 sp_current = sp_new
 
-        if amount_remaining > 0 and L >= EPSILON:
-            dy_net_avail = amount_remaining * (Decimal(1) - fee_rate)
+        if amount_remaining > 0 and L > EPSILON:
+            dy_net_avail = amount_remaining * (1.0 - fee_rate)
             sp_new = sp_current + dy_net_avail / L
-            sp_new = sp_new.quantize(Decimal('1e-18'), rounding=ROUND_DOWN)
-            amount_out += L * (Decimal(1) / sp_current - Decimal(1) / sp_new)
+            amount_out += L * (1.0 / sp_current - 1.0 / sp_new)
             sp_current = sp_new
 
     # Build updated pool state
     updated_pool = copy.deepcopy(pool)
     ua = updated_pool["state"]["attributes"]
-    ua["sqrt_price_x96"] = hex(_decimal_to_sqrt_price_x96(sp_current))
-    new_tick = _tick_from_price(sp_current ** 2)
+    ua["sqrt_price_x96"] = hex(int(max(sp_current, 1e-30) * float(Q96)))
+    new_tick = _tick_from_price(Decimal(sp_current * sp_current))
     ua["tick"] = _int_to_hex(new_tick)
-    ua["liquidity"] = hex(int(L))
+    ua["liquidity"] = hex(int(max(L, 0.0)))
 
-    amount_out_int = int(amount_out.to_integral(rounding=ROUND_DOWN))
+    amount_out_int = int(amount_out)
     return amount_out_int, updated_pool, zero_for_one
 
 

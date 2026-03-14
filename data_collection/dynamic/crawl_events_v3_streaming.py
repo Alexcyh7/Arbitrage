@@ -31,6 +31,34 @@ print(f"V3 Burn signature: {burn_v3_signature} (len: {len(burn_v3_signature)})")
 print(f"V3 Initialize signature: {initialize_v3_signature} (len: {len(initialize_v3_signature)})")
 print(f"V3 Collect signature: {collect_v3_signature} (len: {len(collect_v3_signature)})")
 
+V3_POOL_RUNTIME_ABI = [
+    {
+        "inputs": [],
+        "name": "slot0",
+        "outputs": [
+            {"internalType": "uint160", "name": "sqrtPriceX96", "type": "uint160"},
+            {"internalType": "int24", "name": "tick", "type": "int24"},
+            {"internalType": "uint16", "name": "observationIndex", "type": "uint16"},
+            {"internalType": "uint16", "name": "observationCardinality", "type": "uint16"},
+            {"internalType": "uint16", "name": "observationCardinalityNext", "type": "uint16"},
+            {"internalType": "uint8", "name": "feeProtocol", "type": "uint8"},
+            {"internalType": "bool", "name": "unlocked", "type": "bool"},
+        ],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [],
+        "name": "liquidity",
+        "outputs": [{"internalType": "uint128", "name": "", "type": "uint128"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+]
+
+# Cache for latest snapshot-based V3 pool whitelist.
+_V3_WHITELIST_CACHE = {}
+
 # ----------- 2. 事件解析函数 -----------
 
 def parse_swap_v3_event(log):
@@ -110,8 +138,8 @@ def parse_mint_v3_event(log):
         topic2 = log['topics'][2].hex() if hasattr(log['topics'][2], 'hex') else log['topics'][2]
         topic3 = log['topics'][3].hex() if hasattr(log['topics'][3], 'hex') else log['topics'][3]
         owner = to_checksum_address('0x' + topic1[-40:])
-        tick_lower = int(topic2, 16)
-        tick_upper = int(topic3, 16)
+        tick_lower = int(topic2[-6:], 16)
+        tick_upper = int(topic3[-6:], 16)
         
         # Convert tick values to signed integers
         if tick_lower >= 2**23:
@@ -158,8 +186,8 @@ def parse_burn_v3_event(log):
         topic2 = log['topics'][2].hex() if hasattr(log['topics'][2], 'hex') else log['topics'][2]
         topic3 = log['topics'][3].hex() if hasattr(log['topics'][3], 'hex') else log['topics'][3]
         owner = to_checksum_address('0x' + topic1[-40:])
-        tick_lower = int(topic2, 16)
-        tick_upper = int(topic3, 16)
+        tick_lower = int(topic2[-6:], 16)
+        tick_upper = int(topic3[-6:], 16)
         
         # Convert tick values to signed integers
         if tick_lower >= 2**23:
@@ -228,6 +256,85 @@ def parse_initialize_v3_event(log):
         print(f"解析V3 Initialize事件出错: {e}")
         return {'event_type': 'Initialize', 'error': str(e)}
 
+
+def get_v3_pool_runtime_state(w3, pool_address, block_number, state_cache):
+    """Fetch slot0 + liquidity at a specific block, with per-block cache."""
+    cache_key = (pool_address.lower(), int(block_number))
+    if cache_key in state_cache:
+        return state_cache[cache_key]
+    try:
+        pool = w3.eth.contract(address=to_checksum_address(pool_address), abi=V3_POOL_RUNTIME_ABI)
+        slot0 = pool.functions.slot0().call(block_identifier=block_number)
+        liquidity = pool.functions.liquidity().call(block_identifier=block_number)
+        state = {
+            "sqrtPriceX96": int(slot0[0]),
+            "tick": int(slot0[1]),
+            "liquidity": int(liquidity),
+        }
+        state_cache[cache_key] = state
+        return state
+    except Exception as e:
+        print(f"⚠️  获取V3池运行时状态失败 {pool_address} @ {block_number}: {e}")
+        return None
+
+
+def _extract_block_from_snapshot_name(path: str):
+    base = os.path.basename(path)
+    # snapshot_block_<num>.json
+    try:
+        return int(base.replace("snapshot_block_", "").replace(".json", ""))
+    except Exception:
+        return None
+
+
+def get_v3_pool_whitelist_for_block(block_number: int):
+    """
+    Load Uniswap V3 pools from latest snapshot under full_state_every_10_blocks.
+    Returns:
+        set(lowercase_pool_addr) if snapshot exists
+        None if no snapshot found (disable filtering fallback)
+    """
+    snapshot_files = glob.glob("full_state_every_10_blocks/snapshot_block_*.json")
+    if not snapshot_files:
+        return None
+
+    # Pick latest snapshot with block <= target block.
+    ranked = []
+    for p in snapshot_files:
+        blk = _extract_block_from_snapshot_name(p)
+        if blk is None or blk > int(block_number):
+            continue
+        ranked.append((blk, os.path.getmtime(p), p))
+    if not ranked:
+        return None
+    ranked.sort(reverse=True)
+    latest_path = ranked[0][2]
+    latest_mtime = os.path.getmtime(latest_path)
+
+    cache_key = (latest_path, latest_mtime)
+    if cache_key in _V3_WHITELIST_CACHE:
+        return _V3_WHITELIST_CACHE[cache_key]
+
+    pools = set()
+    try:
+        with open(latest_path, "r", encoding="utf-8") as f:
+            snapshot = json.load(f)
+        for entry in snapshot:
+            if entry.get("protocol_system") != "uniswap_v3":
+                continue
+            comp = entry.get("component", {})
+            static_addr = comp.get("static_attributes", {}).get("pool_address")
+            pool_addr = static_addr or comp.get("id")
+            if pool_addr:
+                pools.add(pool_addr.lower())
+    except Exception as e:
+        print(f"⚠️  加载V3白名单失败（{latest_path}）: {e}")
+        return None
+
+    _V3_WHITELIST_CACHE[cache_key] = pools
+    print(f"[v3] whitelist loaded from {os.path.basename(latest_path)}: {len(pools)} pools")
+    return pools
+
 # ----------- 3. 事件监听和处理主函数 -----------
 
 def handle_new_block(block_number, eth_node_url=None, t_received_override=None, logs_override=None, fast_mode=False):
@@ -295,12 +402,21 @@ def handle_new_block(block_number, eth_node_url=None, t_received_override=None, 
             print(f"Found {len(logs)} V3 events in block {block_number}")
 
         block_events = []  # 当前区块的事件数据
+        pool_state_cache = {}
+        v3_whitelist = get_v3_pool_whitelist_for_block(block_number)
+        skipped_non_whitelist = 0
 
         for log in logs:
             event_type_name = "Unknown"  # 在 try 外面初始化，避免 UnboundLocalError
             try:
                 topic0 = log['topics'][0].hex() if hasattr(log['topics'][0], 'hex') else log['topics'][0]
                 pool_address = to_checksum_address(log['address'])  # 使用导入的函数
+                pool_lower = pool_address.lower()
+
+                # Keep only pools present in latest snapshot (prevents V3-like non-standard contracts).
+                if v3_whitelist is not None and pool_lower not in v3_whitelist:
+                    skipped_non_whitelist += 1
+                    continue
                 
                 # 确保 topic0 有 0x 前缀以便比较
                 if not topic0.startswith('0x'):
@@ -322,6 +438,13 @@ def handle_new_block(block_number, eth_node_url=None, t_received_override=None, 
                 else:
                     print(f"⚠️  未知事件类型，topic0: {topic0}")
                     continue  # Skip unknown events
+
+                # Enrich every V3 event with block-consistent pool runtime state.
+                # This allows downstream dynamic detector updates for Mint/Burn too.
+                if "error" not in parsed_event:
+                    runtime_state = get_v3_pool_runtime_state(w3, pool_address, block_number, pool_state_cache)
+                    if runtime_state is not None:
+                        parsed_event.update(runtime_state)
                 
                 # 收集完整的事件数据
                 event_data = {
@@ -345,6 +468,9 @@ def handle_new_block(block_number, eth_node_url=None, t_received_override=None, 
             except Exception as e:
                 print(f"❌ 处理V3 {event_type_name} log时出错: {e}")
                 print(f"   Block: {block_number}, Pool: {log.get('address', 'unknown')}")
+
+        if skipped_non_whitelist > 0:
+            print(f"⏭️  V3 block {block_number}: skipped {skipped_non_whitelist} non-whitelist events")
 
         # 每个区块处理完后立即写入数据
         if block_events:
